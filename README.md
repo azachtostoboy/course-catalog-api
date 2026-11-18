@@ -81,3 +81,26 @@ fastapi dev main.py
 | Verification | Да — SQL проверен через `--sql`, откат и повторное применение прошли без ошибок, `alembic check` чистый. |
 | History | Да — одна голова `0002 (head)`, миграция закоммичена вместе с моделями, схемами, кодом и `seed.sql`. |
 | Application | Да — поле `level` добавлено в `CourseOut`, фильтр `?level=` добавлен в `GET /courses`, `seed.sql` обновлён. |
+|               |        |
+|               |        |## Bonus
+
+### Task 1. CHECK-ограничение и `op.f(...)`
+- `alembic check` и `alembic revision --autogenerate` не отслеживают `CheckConstraint`: при добавлении `CheckConstraint("level IN ('beginner', 'intermediate', 'advanced')", name="level")` в `Course` автогенерация создаёт пустую миграцию (`pass`), поэтому такие ограничения пишутся вручную через `op.create_check_constraint` и `op.drop_constraint(..., type_="check")`.
+- Обёртка `op.f("courses_level_check")` нужна, чтобы Alembic понимал, что имя уже готовое и к нему **не нужно** повторно применять шаблон `naming_convention` (`ck`). Без `op.f(...)` при откате (`downgrade -1`) шаблон применился дважды и попытался удалить несуществующее ограничение `courses_courses_level_check_check` (`UndefinedObject`). После добавления `op.f(...)` откат прошёл чисто; временная миграция `0003` и ограничение из модели удалены.
+
+### Task 2. Переименование колонки без потери данных
+- При переименовании `description` → `summary` в модели `Course` автогенерация предложила `op.add_column('courses', 'summary', nullable=False)` + `op.drop_column('courses', 'description')` — это уничтожило бы все существующие описания курсов и упало на непустой таблице.
+- Ручная замена на `op.alter_column("courses", "description", new_column_name="summary")` (и обратно в `downgrade()`) переименовывает столбец на месте (`ALTER TABLE ... RENAME COLUMN`), сохраняя все данные без потерь. После проверки на временной базе `scratch` изменения откачены.
+
+### Task 3. Проблема N+1
+- По умолчанию связи `relationship` в SQLAlchemy загружаются лениво (`lazy`), поэтому при обходе 6 курсов и обращении к `course.enrollments` выполняется **7 запросов** (`1` для списка курсов + `6` отдельных `SELECT` для каждого курса).
+- С опцией `selectinload(Course.enrollments)` выполняется всего **2 запроса**: список курсов и один общий запрос `WHERE enrollments.course_id IN (...)` для всех записей сразу.
+- Заметить N+1 можно, включив `SQL_ECHO=true` в `.env` и увидев в логах серию однотипных `SELECT` в цикле. Разница между `selectinload` и `joinedload`: `selectinload` делает 2 отдельных запроса без дублирования строк родителя (лучше подходит для связей «один-ко-многим»), а `joinedload` загружает всё одним запросом через `LEFT OUTER JOIN` (лучше для «многие-к-одному», так как на коллекциях размножает строки родителя).
+
+### Task 4. Потерянное обновление (Lost Update) в ORM
+- Если две сессии (`alice` и `bob`) читают `api-design` с `likes = 11`, каждая делает в Python `a.likes += 1` / `b.likes += 1` и вызывает `commit()`, в БД уходят два запроса `SET likes = 12` — один лайк теряется (в базе оказывается `12` вместо `13`).
+- При замене на SQL-выражение `Course.likes + 1` (как в маршруте `POST /courses/{course_id}/like`) в PostgreSQL отправляется `UPDATE courses SET likes = likes + 1`. База ставит блокировку строки (`row lock`) до `COMMIT` первой транзакции, вторая ждёт, перечитывает актуальное значение `12` и корректно записывает `13`.
+
+### Task 5. `passive_deletes=True` и `ON DELETE CASCADE`
+- Без `passive_deletes=True` на `Student.enrollments` при вызове `session.delete(student)` ORM сама пытается «отвязать» дочерние строки перед удалением студента, отправляя `UPDATE enrollments SET student_id = NULL`. Так как колонка `student_id` имеет ограничение `NOT NULL`, PostgreSQL отклоняет запрос с ошибкой `NotNullViolation`.
+- С параметром `passive_deletes=True` SQLAlchemy не трогает таблицу `enrollments` и отправляет только `DELETE FROM students WHERE id = 3`, передавая каскадное удаление записей на сторону PostgreSQL (`ON DELETE CASCADE`).
