@@ -1,5 +1,6 @@
-fastapi[standard]
+﻿fastapi[standard]
 sqlalchemy
 psycopg[binary]
 alembic
 pydantic-settings
+strawberry-graphql[fastapi]
