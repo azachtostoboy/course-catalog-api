@@ -1,6 +1,6 @@
 # course-catalog-api
 
-Бэкенд каталога курсов: FastAPI, SQLAlchemy 2.1, PostgreSQL и миграции Alembic (Лабораторные работы 4–7).
+Бэкенд каталога курсов: FastAPI, SQLAlchemy 2.1, PostgreSQL, Alembic и GraphQL на Strawberry как второй вход в то же API (Лабораторные работы 4–8).
 
 ## How to run
 
@@ -28,79 +28,93 @@ psql -h localhost -U catalog_app -d course_catalog -v ON_ERROR_STOP=1 -f seed.sq
 fastapi dev main.py
 ```
 
-Документация API: http://localhost:8000/docs. Пароль `change-me` учебный; реальные пароли в репозиторий не добавляются.
+REST-документация (Swagger): http://localhost:8000/docs. GraphiQL: http://localhost:8000/graphql.
+Пароль `change-me` учебный; реальные пароли не коммитятся в репозиторий.
 
 ## What changed in the API
 
-- **Хранение в PostgreSQL:** курсы, студенты и записи перенесены из списков в памяти (`data.py` удалён) в таблицы БД — лайки и новые записи сохраняются после перезапуска сервера.
-- **Изменение `POST /enrollments`:** вместо `studentName` теперь передаётся `studentId` (внешний ключ на `students`), а в ответе возвращаются `id`, `courseId`, `studentId` и `enrolledAt`.
-- **Новые маршруты и `JOIN`:** добавлены `POST /students` (201) и `GET /stats/courses` (статистика записей по курсам, включая курсы с 0 записей). В `GET /enrollments` через `JOIN` подтягиваются `courseTitle` и `studentName`.
-- **Поле `level` и фильтр:** миграцией `0002` добавлено обязательное поле `level` (`beginner` / `intermediate` / `advanced`) и необязательный фильтр `?level=` в `GET /courses`.
-- **Ошибки БД как HTTP-ответы:** нарушения ограничений (`IntegrityError`) определяются по имени ограничения и возвращают `409 Conflict` (дубликат email или повторная запись) и `404 Not Found` (несуществующий курс или студент), а неизвестные ошибки остаются `500`.
+- **Сервисный слой и Problem Details (RFC 9457):** общие бизнес-правила и обработка `IntegrityError` вынесены в `services.py` (`ServiceError`), а `problem.py` переводит ошибки REST в формат `application/problem+json` с полями `type`, `title`, `status`, `detail`, `instance` (`409` и `404`).
+- **Второй вход `/graphql`:** подключён роутер Strawberry (`graphql_api.py`) с типами `Course`, `Student`, `Enrollment` и per-request контекстом (`get_db` + `DataLoader`). При открытии `/graphql` в браузере доступен редактор GraphiQL, а клиенты отправляют `POST` с JSON.
+- **Мутации и `userErrors`:** добавлены мутации `enroll` и `likeCourse`. Ожидаемые ошибки правил (`ALREADY_ENROLLED`, `COURSE_NOT_FOUND`, `STUDENT_NOT_FOUND`) возвращаются внутри `data` в массиве `userErrors`, а ошибки синтаксиса/схемы или сбои — в верхнеуровневом ключе `errors`.
+- **Счётчик SQL (`X-SQL-Queries`):** middleware `counter.py` считает все SQL-запросы через событие SQLAlchemy `before_cursor_execute` и добавляет заголовок `X-SQL-Queries` в каждый HTTP-ответ; с помощью `DataLoader` проблема N+1 устранена (3 запроса вместо 7 и 27).
+- **Защита GraphQL:** ограничена глубина (`QueryDepthLimiter(max_depth=5)`), число алиасов (`MaxAliasesLimiter(max_alias_count=10)`), проверены аргументы `limit` (1..100) и `id`, неожиданные исключения скрыты через `MaskErrors`, а интроспекция управляется переменной `GRAPHQL_INTROSPECTION` в `.env`.
+- **Новые REST-маршруты:** добавлены `GET /students/{student_id}` и `GET /students/{student_id}/enrollments` для экрана «Мои курсы» и сравнительных замеров в `measure.py`.
 
-## Migrations
+## Example queries
 
-| Command | What it does |
-|---------|--------------|
-| `alembic upgrade head` | применяет все недостающие миграции |
-| `alembic downgrade -1` | откатывает последнюю миграцию |
-| `alembic current` | показывает текущую версию базы |
-| `alembic history` | показывает цепочку миграций |
-| `alembic revision --autogenerate -m "text"` | создаёт черновик миграции по разнице моделей и БД |
-| `alembic check` | проверяет, не разошлись ли модели с базой |
-| `alembic upgrade 0001:0002 --sql` | выводит SQL миграции без выполнения |
-| `alembic stamp head` | записывает версию в `alembic_version` без запуска миграций |
+Запрос «Мои курсы» (в панели Variables GraphiQL: `{"id": "2"}`):
+
+```graphql
+query MyCourses($id: ID!) {
+  student(id: $id) {
+    name
+    enrollments {
+      id
+      course { title credits level }
+    }
+  }
+}
+```
+
+Мутация `enroll` (в Variables: `{"input": {"courseId": "web-security", "studentId": "3"}}`) и ответ с `userErrors` при повторной записи:
+
+```graphql
+mutation Enroll($input: EnrollInput!) {
+  enroll(input: $input) {
+    enrollment { id enrolledAt course { title } }
+    userErrors { code message }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "enroll": {
+      "enrollment": null,
+      "userErrors": [
+        {
+          "code": "ALREADY_ENROLLED",
+          "message": "Student is already enrolled in this course"
+        }
+      ]
+    }
+  }
+}
+```
+
+## REST vs GraphQL comparison
+
+Экран «Мои курсы» студента `2`; цифры из `measure.py` на стартовых данных:
+
+| Criterion | REST | GraphQL | Source |
+|-----------|------|---------|--------|
+| Requests and rounds per screen | 5 HTTP-запросов в 2 раунда | 1 HTTP-запрос в 1 раунд | `measure.py`, step 8 |
+| Bytes in the responses | 1145 байт (передаются лишние поля: `description`, `likes`, `isElective`, `enrolledAt`) | 339 байт (только запрошенные `name`, `id`, `title`, `credits`, `level`) | `measure.py`, step 8 |
+| SQL queries per screen | 5 SQL-запросов (студент + записи + 3 отдельных запроса курсов) | 3 SQL-запроса (по одному на уровень благодаря DataLoader) | `measure.py`, `X-SQL-Queries` |
+| SQL growth with more students | Растёт линейно с числом курсов на студента (по отдельному `GET /courses/{id}`) | Без DataLoader: 7 → 27 (и 7 → 24); с DataLoader: стабильно 3 запроса и на 3, и на 20 студентах | `try_n_plus_1.py`, experiments 4–5 |
+| Error in the query text | HTTP `404` / `422` (`res.ok === false`), легко ловится по статусу | HTTP `200 OK`, `data: null`, описание в ключе `errors` — клиент обязан явно проверять `body.errors` | experiments 1 and 8 |
+| Expected rule error (repeated enrollment) | HTTP `409 Conflict`, `application/problem+json`, `type: .../already-enrolled` | HTTP `200 OK`, `data.enroll.enrollment: null`, `userErrors[0].code: "ALREADY_ENROLLED"` | steps 1 and 4 |
+| HTTP cache | Работает из коробки для `GET` (браузер, CDN, `ETag` / `Cache-Control`) | По умолчанию `POST /graphql` не кэшируется HTTP-кэшем (нужны persisted queries или клиентский кэш) | lecture section 14 |
+| Protection from "expensive" queries | Ограничено самим маршрутом и фиксированным `page_size` | Нужны явные лимиты на глубину (`max_depth=5`), алиасы (`max_alias_count=10`), `limit`, `MaskErrors` и отключение интроспекции в проде | experiments 6 and 7 |
+
+**Conclusion.** Простые плоские экраны и публичные справочники (например, список курсов `GET /courses` и карточка одного курса `GET /courses/{id}`) лучше оставить на REST: они укладываются в 1 `GET`-запрос, легко кэшируются по HTTP и не требуют сложной защиты от произвольных запросов. Композитные экраны со связанными сущностями вроде «Мои курсы» выгоднее перевести на GraphQL: он сократил число сетевых раундов с 2 до 1, число запросов с 5 до 1, объём ответа в 3,4 раза (с 1145 до 339 байт) и число SQL-запросов с 5 до 3.
 
 ## Experiment log
 
 | # | Experiment | What I saw | Cause | How I fixed it |
 |---|------------|------------|-------|----------------|
-| 1 | Изменил шаблон `uq` в `naming_convention` | `check_models.py` показал расхождения: `students_email_unique` против `students_email_key` и `enrollments_course_id_unique` против `enrollments_course_id_student_id_key` | Шаблон `uq` перестал совпадать с именами ограничений в PostgreSQL | Вернул `"uq": "%(table_name)s_%(column_0_N_name)s_key"` и проверил `check_models.py` (`none`) |
-| 2 | Убрал `min_length=2` из `StudentIn` и отправил имя `N` | `500 Internal Server Error`, в логе сервера `IntegrityError (CheckViolation)` по `students_name_check` | Без проверки Pydantic запрос дошёл до БД; `CHECK` защитил данные, но его имени нет в `CONSTRAINT_ERRORS` | Вернул `Field(min_length=2)` в `StudentIn`, чтобы Pydantic возвращал `422` до БД |
-| 3 | Опечатка в имени ограничения в `CONSTRAINT_ERRORS` | `500 Internal Server Error` при дубликате email; в логе `UniqueViolation` на `students_email_key` | В словаре был ключ `"students_email_uniq"` вместо `"students_email_key"` | Исправил ключ на `"students_email_key"` и перепроверил `try_errors.py` (5 из 5) |
-| 4 | Убрал `NOT NULL` у `courses.title` в БД и запустил `alembic check` | `FAILED: New upgrade operations detected: modify_nullable` (и `modify_type` при смене типа на `varchar(100)`) | Ручной `ALTER TABLE` привёл к расхождению базы и моделей | Вернул `SET NOT NULL` и `TYPE text`, после чего `alembic check` прошёл чисто |
-| 5 | Автоматическая миграция `0002` на таблице с данными | `IntegrityError (NotNullViolation): column "level" of relation "courses" contains null values`; версия осталась `0001` | `autogenerate` создал `ADD COLUMN level TEXT NOT NULL` без значения по умолчанию на непустой таблице | Переписал `0002` в 3 шага: `nullable=True` → заполнение через `UPDATE ... CASE` → `nullable=False` |
-| 6 | Закомментировал `import models` в `alembic/env.py` | Автогенерация предложила удалить все 3 таблицы (`op.drop_table` для `enrollments`, `courses`, `students`) | Без импорта `models` метаданные `Base.metadata` оказались пустыми | Не применял миграцию, удалил файл `0003_oops.py` и вернул `import models` |
-| 7 | Добавил поле `phone` в `Student` без миграции | `alembic check` выдал ошибку `Detected added column 'students.phone'` | Модель ушла вперёд относительно схемы базы данных | Удалил тестовое поле `phone` из модели и проверил `alembic check` |
-| 8 | Создал две миграции от одной ревизии `0002` | `alembic heads` показал 2 головы (`0003` и `0004`), `upgrade head` упал с `Multiple head revisions are present` | Две параллельные ветки миграций от одного родителя | Объединил через `alembic merge heads`, затем удалил экспериментальные файлы `0003`–`0005` |
+| 1 | Опечатка в имени поля (`titel`) и аргумент в `snake_case` (`is_elective`) | HTTP `200 OK`, `data: null`, в `errors` подсказки `Did you mean 'title'...` и `Did you mean 'isElective'?` | Движок валидирует запрос по схеме до выполнения; Strawberry переводит имена Python из `snake_case` в `camelCase` | Исправил имена на `title` и `isElective` и запомнил, что статус `200` не гарантирует успех — нужно проверять `errors` |
+| 2 | Убрал `\| None` у запроса `course` и запросил `"nope"` | Ошибка `Cannot return null for non-nullable field Query.course.`; при алиасах `a` и `b` обнулился весь `data` | Правило null propagation: `null` в поле с `!` поднимается до ближайшего nullable-родителя (до всего `data`) | Вернул `CourseType \| None`, чтобы отсутствующий курс возвращал `null` без поломки соседних полей |
+| 3 | Отправил мутацию `likeCourse` методом `GET` | HTTP `400 Bad Request` (обычный текст): `mutations are not allowed when using GET`; лайки не изменились | По стандарту HTTP `GET` должен быть безопасным и не менять состояние сервера | Отправляю мутации только методом `POST` с `Content-Type: application/json` |
+| 4 | `more_students.sql`: 3 и 20 студентов, счётчик `X-SQL-Queries` | На 3 студентах: 7 и 7 SQL-запросов; на 20 студентах: 27 (`1+20+6`) и 24 (`1+6+17`) SQL-запроса | Ленивая загрузка SQLAlchemy в резолверах вызывает N+1 — отдельный `SELECT` на каждый объект | Заменил ленивые атрибуты на `DataLoader` (`WHERE ... IN (...)`), число запросов упало до 3 и 3 |
+| 5 | Сломал batch-функцию DataLoader (возврат строк без сортировки по ключам) | На `students`: `WrongNumberOfResultsReturned (expected: 3, received: 6)`; на `enrollments`: ошибок нет, но 4 из 6 записей получили чужие курсы | DataLoader сопоставляет результаты с ключами по позиции; без группировки `groups[key]` порядок из БД не совпадает с `keys` | Вернул рабочую версию через `git restore graphql_api.py` (сопоставление по значению ключа через `defaultdict`) |
+| 6 | 6 опасных запросов и 12 лайков до и после защиты | До защиты: цикл глубины 6 и 12 алиасов выполнились (24 SQL-запроса), а плохие `limit`/`id` слили SQL и стек psycopg. После защиты: цикл, 12 алиасов (0 SQL), `limit -1` и `id "abc"` дали короткие ошибки, а 20-значный `id` скрыт как `Unexpected error.` | Без лимитов клиент сам управляет стоимостью запроса, а необработанные исключения утекают в `errors` | Добавил `QueryDepthLimiter(5)`, `MaxAliasesLimiter(10)`, проверки `check_limit`/`parse_id` и `MaskErrors`; восстановил данные `seed.sql` |
+| 7 | `GRAPHQL_INTROSPECTION=false`, опечатка `cours` | Запрос `__schema` отклонён (`GraphQL introspection has been disabled`), обычные запросы работают, но опечатка `cours` всё ещё выдала `Did you mean 'course' or 'courses'?` | Отключение интроспекции скрывает карту схемы, но подсказки валидатора всё ещё раскрывают имена полей — интроспекция не заменяет авторизацию | Вернул `GRAPHQL_INTROSPECTION=true` для разработки в GraphiQL |
+| 8 | Сбои на фронтенде: опечатка `titel`, убранная проверка `errors`, выключенный API | 1) `GraphQLRequestError: Cannot query field 'titel'`; 2) `TypeError: Cannot destructure property 'student' ... as it is null`; 3) `TypeError: fetch failed` | Без проверки `body.errors` при статусе `200` код принимает `data: null` за успех и падает с непонятным `TypeError` | Восстановил файлы через `git restore .` и оставил обязательную проверку `if (body.errors?.length)` в `lib/graphql.ts` |
 
 ## Decisions
 
-- **Имя ограничения вместо SQLSTATE и перехват после `commit`:** код `23505` одинаковый для всех `UNIQUE`, а `23503` — для всех внешних ключей, поэтому точно понять причину можно только по `constraint_name`. Ловить ошибку после `db.commit()` надёжнее, чем проверять заранее через `SELECT`, потому что между `SELECT` и `INSERT` другой запрос может успеть занять тот же email (состояние гонки).
-- **Атомарный `UPDATE courses SET likes = likes + 1`:** если читать `likes` в Python, прибавлять 1 и записывать обратно, два одновременных запроса прочитают старое число и один лайк потеряется (lost update). При инкременте в SQL база сама блокирует строку и применяет оба обновления по очереди.
-- **Трёхшаговая миграция `0002`:** PostgreSQL не позволяет добавить колонку `NOT NULL` без значения по умолчанию в таблицу, где уже есть строки. Разбиение на `ADD COLUMN (nullable=True)` → `UPDATE` существующих строк → `ALTER COLUMN SET NOT NULL` внутри одной транзакции безопасно обновляет таблицу без потери данных.
-
-## Migration 0002 self-check
-
-| What to check | Result |
-|---------------|--------|
-| Goal and steps | Да — добавляется одна обязательная колонка `courses.level` в три понятных шага. |
-| Data | Да — существующие 6 курсов заполняются по правилу `CASE WHEN is_elective THEN 'beginner' ELSE 'intermediate' END` до установки `NOT NULL`. |
-| Renames and drops | Да — ничего не переименовывается и не удаляется в `upgrade()`, данные не теряются. |
-| Rollback | Да — `downgrade()` удаляет `courses.level`; цикл `downgrade -1` → `upgrade head` проверен (с учётом того, что в продакшене откат сотрёт значения колонки). |
-| Verification | Да — SQL проверен через `--sql`, откат и повторное применение прошли без ошибок, `alembic check` чистый. |
-| History | Да — одна голова `0002 (head)`, миграция закоммичена вместе с моделями, схемами, кодом и `seed.sql`. |
-| Application | Да — поле `level` добавлено в `CourseOut`, фильтр `?level=` добавлен в `GET /courses`, `seed.sql` обновлён. |
-|               |        |
-|               |        |## Bonus
-
-### Task 1. CHECK-ограничение и `op.f(...)`
-- `alembic check` и `alembic revision --autogenerate` не отслеживают `CheckConstraint`: при добавлении `CheckConstraint("level IN ('beginner', 'intermediate', 'advanced')", name="level")` в `Course` автогенерация создаёт пустую миграцию (`pass`), поэтому такие ограничения пишутся вручную через `op.create_check_constraint` и `op.drop_constraint(..., type_="check")`.
-- Обёртка `op.f("courses_level_check")` нужна, чтобы Alembic понимал, что имя уже готовое и к нему **не нужно** повторно применять шаблон `naming_convention` (`ck`). Без `op.f(...)` при откате (`downgrade -1`) шаблон применился дважды и попытался удалить несуществующее ограничение `courses_courses_level_check_check` (`UndefinedObject`). После добавления `op.f(...)` откат прошёл чисто; временная миграция `0003` и ограничение из модели удалены.
-
-### Task 2. Переименование колонки без потери данных
-- При переименовании `description` → `summary` в модели `Course` автогенерация предложила `op.add_column('courses', 'summary', nullable=False)` + `op.drop_column('courses', 'description')` — это уничтожило бы все существующие описания курсов и упало на непустой таблице.
-- Ручная замена на `op.alter_column("courses", "description", new_column_name="summary")` (и обратно в `downgrade()`) переименовывает столбец на месте (`ALTER TABLE ... RENAME COLUMN`), сохраняя все данные без потерь. После проверки на временной базе `scratch` изменения откачены.
-
-### Task 3. Проблема N+1
-- По умолчанию связи `relationship` в SQLAlchemy загружаются лениво (`lazy`), поэтому при обходе 6 курсов и обращении к `course.enrollments` выполняется **7 запросов** (`1` для списка курсов + `6` отдельных `SELECT` для каждого курса).
-- С опцией `selectinload(Course.enrollments)` выполняется всего **2 запроса**: список курсов и один общий запрос `WHERE enrollments.course_id IN (...)` для всех записей сразу.
-- Заметить N+1 можно, включив `SQL_ECHO=true` в `.env` и увидев в логах серию однотипных `SELECT` в цикле. Разница между `selectinload` и `joinedload`: `selectinload` делает 2 отдельных запроса без дублирования строк родителя (лучше подходит для связей «один-ко-многим»), а `joinedload` загружает всё одним запросом через `LEFT OUTER JOIN` (лучше для «многие-к-одному», так как на коллекциях размножает строки родителя).
-
-### Task 4. Потерянное обновление (Lost Update) в ORM
-- Если две сессии (`alice` и `bob`) читают `api-design` с `likes = 11`, каждая делает в Python `a.likes += 1` / `b.likes += 1` и вызывает `commit()`, в БД уходят два запроса `SET likes = 12` — один лайк теряется (в базе оказывается `12` вместо `13`).
-- При замене на SQL-выражение `Course.likes + 1` (как в маршруте `POST /courses/{course_id}/like`) в PostgreSQL отправляется `UPDATE courses SET likes = likes + 1`. База ставит блокировку строки (`row lock`) до `COMMIT` первой транзакции, вторая ждёт, перечитывает актуальное значение `12` и корректно записывает `13`.
-
-### Task 5. `passive_deletes=True` и `ON DELETE CASCADE`
-- Без `passive_deletes=True` на `Student.enrollments` при вызове `session.delete(student)` ORM сама пытается «отвязать» дочерние строки перед удалением студента, отправляя `UPDATE enrollments SET student_id = NULL`. Так как колонка `student_id` имеет ограничение `NOT NULL`, PostgreSQL отклоняет запрос с ошибкой `NotNullViolation`.
-- С параметром `passive_deletes=True` SQLAlchemy не трогает таблицу `enrollments` и отправляет только `DELETE FROM students WHERE id = 3`, передавая каскадное удаление записей на сторону PostgreSQL (`ON DELETE CASCADE`).
+- **Единый слой правил в `services.py`:** правила и обработка `IntegrityError` написаны один раз в `services.py` и бросают `ServiceError` с кодом. REST (`problem.py`) переводит его в HTTP-статус и `application/problem+json`, а GraphQL (`graphql_api.py`) — в `userErrors`. Дублировать проверки в двух слоях нельзя, иначе правила неизбежно разойдутся.
+- **Per-request `DataLoader` и сопоставление по ключам:** лоадеры создаются заново в `Context` на каждый HTTP-запрос, потому что DataLoader кэширует результаты по ключу — один общий лоадер на всё приложение отдавал бы чужие или устаревшие данные. Сопоставление через словарь `groups[key]` обязательно, потому что SQL `IN (...)` не гарантирует порядок строк, и тихая подмена чужих курсов опаснее явного исключения.
+- **Двухслойная защита (`check_limit`/`parse_id` + `MaskErrors`):** для предсказуемых ошибок ввода клиента мы сами кидаем понятный `GraphQLError` (`Invalid ID: 'abc'`, `limit must be between 1 and 100`), чтобы клиент мог исправить запрос. А `MaskErrors` страхует от непредвиденных сбоев (например, переполнение `bigint`), заменяя их на `Unexpected error.` и скрывая SQL и внутренности БД.
