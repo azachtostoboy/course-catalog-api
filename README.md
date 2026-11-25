@@ -118,3 +118,18 @@ mutation Enroll($input: EnrollInput!) {
 - **Единый слой правил в `services.py`:** правила и обработка `IntegrityError` написаны один раз в `services.py` и бросают `ServiceError` с кодом. REST (`problem.py`) переводит его в HTTP-статус и `application/problem+json`, а GraphQL (`graphql_api.py`) — в `userErrors`. Дублировать проверки в двух слоях нельзя, иначе правила неизбежно разойдутся.
 - **Per-request `DataLoader` и сопоставление по ключам:** лоадеры создаются заново в `Context` на каждый HTTP-запрос, потому что DataLoader кэширует результаты по ключу — один общий лоадер на всё приложение отдавал бы чужие или устаревшие данные. Сопоставление через словарь `groups[key]` обязательно, потому что SQL `IN (...)` не гарантирует порядок строк, и тихая подмена чужих курсов опаснее явного исключения.
 - **Двухслойная защита (`check_limit`/`parse_id` + `MaskErrors`):** для предсказуемых ошибок ввода клиента мы сами кидаем понятный `GraphQLError` (`Invalid ID: 'abc'`, `limit must be between 1 and 100`), чтобы клиент мог исправить запрос. А `MaskErrors` страхует от непредвиденных сбоев (например, переполнение `bigint`), заменяя их на `Unexpected error.` и скрывая SQL и внутренности БД.
+
+
+## Bonus
+
+### Task 1. Validation errors as Problem Details
+- Добавлен обработчик `RequestValidationError` в `problem.py`: ошибки валидации Pydantic теперь тоже возвращаются с кодом `422` и заголовком `application/problem+json` (`type: .../validation-error`), а не в стандартном формате FastAPI (`application/json`).
+- Обработчик берёт список ошибок из `exc.errors()` и преобразует каждый элемент в `{in, field, detail}`. Поле `errors` — это расширение (extension member) стандарта RFC 9457, а не его обязательная часть, поэтому базовый формат Problem Details остаётся валидным, а клиент получает сразу все неверные поля за один ответ.
+
+### Task 2. `createStudent` mutation: one rule for REST and GraphQL
+- Проверка «имя после `strip()` должно быть не короче 2 символов» вынесена в `services.create_student` (`ServiceError("INVALID_NAME", ...)`), добавлен код `INVALID_NAME` (422, `invalid-name`) в `problem.py` и мутация `createStudent(input: CreateStudentInput!): CreateStudentPayload!` в `graphql_api.py`.
+- Одно правило в `services.py` работает одинаково и в REST (`422 application/problem+json` на имя `"  "`), и в GraphQL (`userErrors[0].code = "INVALID_NAME"`). При добавлении нового кода ошибки в `services.py` обязательно нужно добавить его перевод в словарь `PROBLEMS` в `problem.py`, иначе REST упадёт с `500 KeyError`.
+
+### Task 3. Blocking resolver: four requests at once
+- При 4 одновременных запросах с `SELECT pg_sleep(0.5)` обычный синхронный REST-маршрут `def` (FastAPI сам запускает его в threadpool) и `async`-резолвер GraphQL с `run_in_threadpool` выполняются параллельно примерно за `0.5 s`, а синхронный резолвер Strawberry (`def slow_sync`) блокирует event loop, выстраивает 4 запроса в очередь и выполняется в 4 раза дольше (`~2.0 s`).
+- Разница видна в `blocking_app.py` между `def slow_sync` (выполняется прямо в потоке event loop) и `async def slow_threadpool` с `await run_in_threadpool(pause, ...)`. В учебном проекте запросы занимают миллисекунды, поэтому это незаметно, но на тяжёлых SQL-запросах или под высокой нагрузкой синхронные резолверы блокируют весь сервер. При этом одну сессию SQLAlchemy нельзя безопасно делить между параллельно выполняемыми полями в разных потоках.
